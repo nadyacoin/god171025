@@ -8,9 +8,10 @@ import asyncio
 import os
 import subprocess
 import sys
+import json
+from pathlib import Path
 
 import toml
-
 
 # Add project root to python path to import modules
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,7 +24,6 @@ import trainer.utils.training_paths as train_paths
 from core.config.config_handler import save_config_toml
 from core.dataset.prepare_diffusion_dataset import prepare_dataset
 from core.models.utility_models import ImageModelType
-
 
 def get_model_path(path: str) -> str:
     if os.path.isdir(path):
@@ -42,7 +42,7 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
     with open(config_template_path, "r") as file:
         config = toml.load(file)
 
-    # Update config
+    # (mapping omitted for brevity — keep existing mappings)
     network_config_person = {
         "stabilityai/stable-diffusion-xl-base-1.0": 235,
         "Lykon/dreamshaper-xl-1-0": 235,
@@ -162,19 +162,34 @@ def create_config(task_id, model_path, model_name, model_type, expected_repo_nam
     print(f"Created config at {config_path}", flush=True)
     return config_path
 
+def _detect_gpu_count():
+    try:
+        import torch
+        return max(1, torch.cuda.device_count())
+    except Exception:
+        return int(os.environ.get("NUM_PROCESSES", "1"))
 
 def run_training(model_type, config_path):
     print(f"Starting training with config: {config_path}", flush=True)
 
+    # adaptive process / thread counts
+    num_processes = int(os.environ.get("NUM_PROCESSES", _detect_gpu_count()))
+    cpu_count = os.cpu_count() or 1
+    num_cpu_threads_per_process = int(os.environ.get("NUM_CPU_THREADS_PER_PROCESS", max(1, cpu_count // num_processes)))
+
+    # mixed precision env override
+    mixed_precision = os.environ.get("MIXED_PRECISION", "bf16")
+
+    training_command = []
     if model_type == "sdxl":
         training_command = [
             "accelerate", "launch",
             "--dynamo_backend", "no",
             "--dynamo_mode", "default",
-            "--mixed_precision", "bf16",
-            "--num_processes", "1",
+            "--mixed_precision", mixed_precision,
+            "--num_processes", str(num_processes),
             "--num_machines", "1",
-            "--num_cpu_threads_per_process", "2",
+            "--num_cpu_threads_per_process", str(num_cpu_threads_per_process),
             f"/app/sd-script/{model_type}_train_network.py",
             "--config_file", config_path
         ]
@@ -183,39 +198,57 @@ def run_training(model_type, config_path):
             "accelerate", "launch",
             "--dynamo_backend", "no",
             "--dynamo_mode", "default",
-            "--mixed_precision", "bf16",
-            "--num_processes", "1",
+            "--mixed_precision", mixed_precision,
+            "--num_processes", str(num_processes),
             "--num_machines", "1",
-            "--num_cpu_threads_per_process", "2",
+            "--num_cpu_threads_per_process", str(num_cpu_threads_per_process),
             f"/app/sd-scripts/{model_type}_train_network.py",
             "--config_file", config_path
         ]
 
+    # prepare environment
+    training_env = os.environ.copy()
+    training_env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    training_env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    # performance related
+    training_env["OMP_NUM_THREADS"] = str(num_cpu_threads_per_process)
+    training_env["MKL_NUM_THREADS"] = str(num_cpu_threads_per_process)
+    # (optional) tune NCCL for multi-node/multi-interface cases via env vars if needed:
+    # training_env.setdefault("NCCL_DEBUG", "WARN")
+
+    # log file next to config
+    log_path = f"{config_path}.log"
+    print(f"Launching training subprocess: {' '.join(training_command)}", flush=True)
     try:
-        print("Starting training subprocess...\n", flush=True)
-        process = subprocess.Popen(
-            training_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        with open(log_path, "a", buffering=1) as log_f:
+            process = subprocess.Popen(
+                training_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=training_env
+            )
 
-        for line in process.stdout:
-            print(line, end="", flush=True)
+            for line in process.stdout:
+                # stream to both stdout and the log file
+                print(line, end="", flush=True)
+                try:
+                    log_f.write(line)
+                except Exception:
+                    pass
 
-        return_code = process.wait()
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, training_command)
+            return_code = process.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, training_command)
 
-        print("Training subprocess completed successfully.", flush=True)
+            print("Training subprocess completed successfully.", flush=True)
 
     except subprocess.CalledProcessError as e:
         print("Training subprocess failed!", flush=True)
         print(f"Exit Code: {e.returncode}", flush=True)
         print(f"Command: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}", flush=True)
         raise RuntimeError(f"Training subprocess failed with exit code {e.returncode}")
-
 
 async def main():
     print("---STARTING IMAGE TRAINING SCRIPT---", flush=True)

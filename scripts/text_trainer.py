@@ -16,7 +16,6 @@ import pathlib
 import yaml
 from transformers import AutoTokenizer
 
-
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.append(project_root)
@@ -34,7 +33,6 @@ from core.models.utility_models import GrpoDatasetType
 from core.models.utility_models import InstructTextDatasetType
 from core.models.utility_models import TaskType
 from miner.logic.job_handler import create_reward_funcs_file
-
 
 def patch_wandb_symlinks(base_dir:str):
     for root, _, files in os.walk(base_dir):
@@ -60,7 +58,6 @@ def patch_wandb_symlinks(base_dir:str):
                 else:
                     print("Target not found, creating dummy")
                     pathlib.Path(full_path).touch()
-
 
 def patch_model_metadata(output_dir: str, base_model_id: str):
     try:
@@ -103,7 +100,6 @@ def patch_model_metadata(output_dir: str, base_model_id: str):
         print(f"Error updating metadata: {e}", flush=True)
         pass
 
-
 def copy_dataset_to_axolotl_directories(dataset_path):
     dataset_filename = os.path.basename(dataset_path)
     data_path, root_path = train_paths.get_axolotl_dataset_paths(dataset_filename)
@@ -111,7 +107,6 @@ def copy_dataset_to_axolotl_directories(dataset_path):
     shutil.copy(dataset_path, root_path)
 
     return data_path
-
 
 def create_config(task_id, model, dataset, dataset_type, file_format, output_dir, expected_repo_name=None, log_wandb=True):
     """Create the axolotl config file with appropriate settings."""
@@ -167,6 +162,12 @@ def create_config(task_id, model, dataset, dataset_type, file_format, output_dir
     save_config(config, config_path)
     return config_path
 
+def _detect_gpu_count():
+    try:
+        import torch
+        return max(1, torch.cuda.device_count())
+    except Exception:
+        return int(os.environ.get("NUM_PROCESSES", "1"))
 
 def run_training(config_path):
     print(f"Starting training with config: {config_path}", flush=True)
@@ -178,37 +179,57 @@ def run_training(config_path):
     training_env["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     training_env["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
+    # adaptive process count
+    num_processes = int(os.environ.get("NUM_PROCESSES", _detect_gpu_count()))
+    cpu_count = os.cpu_count() or 1
+    num_cpu_threads_per_process = int(os.environ.get("NUM_CPU_THREADS_PER_PROCESS", max(1, cpu_count // num_processes)))
+    mixed_precision = os.environ.get("MIXED_PRECISION", "bf16")
+
+    # set runtime performance environment
+    training_env["OMP_NUM_THREADS"] = str(num_cpu_threads_per_process)
+    training_env["MKL_NUM_THREADS"] = str(num_cpu_threads_per_process)
+
     training_command = [
-    "accelerate", "launch",
-    "-m", "axolotl.cli.train",
-    config_path
+        "accelerate", "launch",
+        "--mixed_precision", mixed_precision,
+        "--num_processes", str(num_processes),
+        "--num_machines", "1",
+        "--num_cpu_threads_per_process", str(num_cpu_threads_per_process),
+        "-m", "axolotl.cli.train",
+        config_path
     ]
 
+    log_path = f"{config_path}.log"
     try:
         print("Starting training subprocess...\n", flush=True)
-        process = subprocess.Popen(
-            training_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        with open(log_path, "a", buffering=1) as log_f:
+            process = subprocess.Popen(
+                training_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=training_env
+            )
 
-        for line in process.stdout:
-            print(line, end="", flush=True)
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                try:
+                    log_f.write(line)
+                except Exception:
+                    pass
 
-        return_code = process.wait()
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, training_command)
+            return_code = process.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, training_command)
 
-        print("Training subprocess completed successfully.", flush=True)
+            print("Training subprocess completed successfully.", flush=True)
 
     except subprocess.CalledProcessError as e:
         print("Training subprocess failed!", flush=True)
         print(f"Exit Code: {e.returncode}", flush=True)
         print(f"Command: {' '.join(e.cmd) if isinstance(e.cmd, list) else e.cmd}", flush=True)
         raise RuntimeError(f"Training subprocess failed with exit code {e.returncode}")
-
 
 
 async def main():
